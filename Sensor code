@@ -5,16 +5,14 @@
 #include <U8g2lib.h>
 #include <math.h>
 
-// =====================================================
+
 // DEVICES
-// =====================================================
 MAX30105 pulseSensor;
 Adafruit_MLX90614 tempSensor = Adafruit_MLX90614();
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 
-// =====================================================
+
 // HEART RATE SETTINGS
-// =====================================================
 const long IR_FINGER_THRESHOLD = 8000;
 const byte BPM_BUFFER_SIZE = 8;
 
@@ -28,9 +26,7 @@ bool fingerDetected = false;
 bool bpmValid = false;
 unsigned long lastBeatTime = 0;
 
-// =====================================================
 // TEMPERATURE SETTINGS
-// =====================================================
 float rawAmbientTemp = NAN;
 float rawObjectTemp = NAN;
 float calibratedAmbientTemp = NAN;
@@ -39,29 +35,26 @@ float calibratedObjectTemp = NAN;
 bool tempValid = false;
 bool tempStable = false;
 
-// ---- Calibration offsets ----
+// Calibration offsets
 // Replace these with your own tested offsets
 const float AMBIENT_TEMP_OFFSET = 0.00;
 const float OBJECT_TEMP_OFFSET  = -0.50;
 
-// ---- Temperature validity rules ----
+// Temperature validity rules
 const float MIN_VALID_BODY_TEMP = 25.0;
 const float MAX_VALID_BODY_TEMP = 45.0;
 const float MAX_TEMP_JUMP = 1.00;       // reject sudden jumps larger than this
 const float STABILITY_RANGE_LIMIT = 0.60;
 
-// =====================================================
 // TEMPERATURE STABILITY TRACKING
-// =====================================================
 float lastAcceptedObjectTemp = NAN;
 float tempMin = 999.0;
 float tempMax = -999.0;
 float tempSum = 0.0;
 unsigned long tempSampleCount = 0;
 
-// =====================================================
+
 // TIMING
-// =====================================================
 unsigned long lastTempReadTime = 0;
 unsigned long lastDisplayTime = 0;
 unsigned long lastDebugTime = 0;
@@ -70,9 +63,7 @@ const unsigned long TEMP_INTERVAL_MS = 500;
 const unsigned long DISPLAY_INTERVAL_MS = 200;
 const unsigned long DEBUG_INTERVAL_MS = 500;
 
-// =====================================================
 // HELPER FUNCTIONS
-// =====================================================
 void resetHeartData() {
   currentBpm = 0.0;
   averageBpm = 0;
