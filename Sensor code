@@ -3,80 +3,134 @@
 #include "heartRate.h"
 #include <Adafruit_MLX90614.h>
 #include <U8g2lib.h>
+#include <math.h>
 
-// =========================
-// Devices
-// =========================
+// =====================================================
+// DEVICES
+// =====================================================
 MAX30105 pulseSensor;
 Adafruit_MLX90614 tempSensor = Adafruit_MLX90614();
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 
-// =========================
-// Heart rate variables
-// =========================
-const byte BPM_SLOTS = 8;
-int bpmBuffer[BPM_SLOTS];
-byte bpmPointer = 0;
-byte bpmStored = 0;
+// =====================================================
+// HEART RATE SETTINGS
+// =====================================================
+const long IR_FINGER_THRESHOLD = 8000;
+const byte BPM_BUFFER_SIZE = 8;
+
+int bpmBuffer[BPM_BUFFER_SIZE];
+byte bpmWriteIndex = 0;
+byte bpmCount = 0;
 
 float currentBpm = 0.0;
 int averageBpm = 0;
-unsigned long previousBeatTime = 0;
 bool fingerDetected = false;
+bool bpmValid = false;
+unsigned long lastBeatTime = 0;
 
-// =========================
-// Temperature variables
-// =========================
-float ambientTemp = NAN;
-float objectTemp = NAN;
+// =====================================================
+// TEMPERATURE SETTINGS
+// =====================================================
+float rawAmbientTemp = NAN;
+float rawObjectTemp = NAN;
+float calibratedAmbientTemp = NAN;
+float calibratedObjectTemp = NAN;
 
-// =========================
-// Timing
-// =========================
-unsigned long previousTempRead = 0;
-unsigned long previousDisplayRefresh = 0;
-const unsigned long TEMP_READ_INTERVAL = 500;
-const unsigned long DISPLAY_INTERVAL = 200;
+bool tempValid = false;
+bool tempStable = false;
 
-// =========================
-// Settings
-// =========================
-const long IR_FINGER_THRESHOLD = 8000;
+// ---- Calibration offsets ----
+// Replace these with your own tested offsets
+const float AMBIENT_TEMP_OFFSET = 0.00;
+const float OBJECT_TEMP_OFFSET  = -0.50;
 
-// =========================
-// Helpers
-// =========================
+// ---- Temperature validity rules ----
+const float MIN_VALID_BODY_TEMP = 25.0;
+const float MAX_VALID_BODY_TEMP = 45.0;
+const float MAX_TEMP_JUMP = 1.00;       // reject sudden jumps larger than this
+const float STABILITY_RANGE_LIMIT = 0.60;
+
+// =====================================================
+// TEMPERATURE STABILITY TRACKING
+// =====================================================
+float lastAcceptedObjectTemp = NAN;
+float tempMin = 999.0;
+float tempMax = -999.0;
+float tempSum = 0.0;
+unsigned long tempSampleCount = 0;
+
+// =====================================================
+// TIMING
+// =====================================================
+unsigned long lastTempReadTime = 0;
+unsigned long lastDisplayTime = 0;
+unsigned long lastDebugTime = 0;
+
+const unsigned long TEMP_INTERVAL_MS = 500;
+const unsigned long DISPLAY_INTERVAL_MS = 200;
+const unsigned long DEBUG_INTERVAL_MS = 500;
+
+// =====================================================
+// HELPER FUNCTIONS
+// =====================================================
 void resetHeartData() {
-  currentBpm = 0;
+  currentBpm = 0.0;
   averageBpm = 0;
-  previousBeatTime = 0;
-  bpmPointer = 0;
-  bpmStored = 0;
+  bpmValid = false;
+  lastBeatTime = 0;
+  bpmWriteIndex = 0;
+  bpmCount = 0;
 
-  for (byte i = 0; i < BPM_SLOTS; i++) {
+  for (byte i = 0; i < BPM_BUFFER_SIZE; i++) {
     bpmBuffer[i] = 0;
   }
 }
 
-void pushBpm(int value) {
-  bpmBuffer[bpmPointer] = value;
-  bpmPointer = (bpmPointer + 1) % BPM_SLOTS;
+void pushBpmSample(int bpmValue) {
+  bpmBuffer[bpmWriteIndex] = bpmValue;
+  bpmWriteIndex = (bpmWriteIndex + 1) % BPM_BUFFER_SIZE;
 
-  if (bpmStored < BPM_SLOTS) {
-    bpmStored++;
+  if (bpmCount < BPM_BUFFER_SIZE) {
+    bpmCount++;
   }
 
-  int sum = 0;
-  for (byte i = 0; i < bpmStored; i++) {
-    sum += bpmBuffer[i];
+  long total = 0;
+  for (byte i = 0; i < bpmCount; i++) {
+    total += bpmBuffer[i];
   }
 
-  if (bpmStored > 0) {
-    averageBpm = sum / bpmStored;
+  if (bpmCount > 0) {
+    averageBpm = total / bpmCount;
+  } else {
+    averageBpm = 0;
   }
 }
 
-void readHeart() {
+void resetTempStats() {
+  tempMin = 999.0;
+  tempMax = -999.0;
+  tempSum = 0.0;
+  tempSampleCount = 0;
+  tempStable = false;
+}
+
+void updateTemperatureStats(float value) {
+  if (value < tempMin) tempMin = value;
+  if (value > tempMax) tempMax = value;
+
+  tempSum += value;
+  tempSampleCount++;
+
+  float range = tempMax - tempMin;
+  tempStable = (range <= STABILITY_RANGE_LIMIT);
+}
+
+float getAverageTemperature() {
+  if (tempSampleCount == 0) return NAN;
+  return tempSum / tempSampleCount;
+}
+
+void readHeartRate() {
   long irValue = pulseSensor.getIR();
   fingerDetected = (irValue > IR_FINGER_THRESHOLD);
 
@@ -88,87 +142,157 @@ void readHeart() {
   if (checkForBeat(irValue)) {
     unsigned long now = millis();
 
-    if (previousBeatTime != 0) {
-      float secondsBetween = (now - previousBeatTime) / 1000.0;
-      float bpm = 60.0 / secondsBetween;
+    if (lastBeatTime != 0) {
+      float deltaSeconds = (now - lastBeatTime) / 1000.0;
 
-      if (bpm >= 35 && bpm <= 200) {
-        currentBpm = bpm;
-        pushBpm((int)(bpm + 0.5));
+      if (deltaSeconds > 0.0) {
+        float newBpm = 60.0 / deltaSeconds;
+
+        // data quality check for BPM
+        if (newBpm >= 35.0 && newBpm <= 200.0) {
+          currentBpm = newBpm;
+          pushBpmSample((int)(newBpm + 0.5));
+          bpmValid = true;
+        } else {
+          bpmValid = false;
+        }
       }
     }
 
-    previousBeatTime = now;
+    lastBeatTime = now;
   }
 }
 
 void readTemperature() {
-  float roomTemp = tempSensor.readAmbientTempC();
-  float targetTemp = tempSensor.readObjectTempC();
+  rawAmbientTemp = tempSensor.readAmbientTempC();
+  rawObjectTemp = tempSensor.readObjectTempC();
 
-  if (!isnan(roomTemp)) {
-    ambientTemp = roomTemp;
+  if (isnan(rawAmbientTemp) || isnan(rawObjectTemp)) {
+    tempValid = false;
+    return;
   }
 
-  if (!isnan(targetTemp)) {
-    objectTemp = targetTemp;
+  // calibration applied here
+  float correctedAmbient = rawAmbientTemp + AMBIENT_TEMP_OFFSET;
+  float correctedObject  = rawObjectTemp + OBJECT_TEMP_OFFSET;
+
+  // human-use range check
+  if (correctedObject < MIN_VALID_BODY_TEMP || correctedObject > MAX_VALID_BODY_TEMP) {
+    tempValid = false;
+    return;
   }
+
+  // sudden jump rejection for consistency / noise control
+  if (!isnan(lastAcceptedObjectTemp)) {
+    if (fabs(correctedObject - lastAcceptedObjectTemp) > MAX_TEMP_JUMP) {
+      tempValid = false;
+      return;
+    }
+  }
+
+  calibratedAmbientTemp = correctedAmbient;
+  calibratedObjectTemp = correctedObject;
+  lastAcceptedObjectTemp = correctedObject;
+  tempValid = true;
+
+  updateTemperatureStats(correctedObject);
 }
 
-void drawScreen() {
+void drawDisplay() {
   char line1[24];
   char line2[24];
   char line3[24];
   char line4[24];
+  char line5[24];
 
-  if (fingerDetected) {
-    strcpy(line1, "Finger: YES");
-  } else {
-    strcpy(line1, "Finger: NO");
-  }
-
-  dtostrf(currentBpm, 4, 1, line2);
-  char bpmText[24];
-  sprintf(bpmText, "BPM: %s", line2);
-
+  strcpy(line1, fingerDetected ? "Finger: YES" : "Finger: NO");
+  sprintf(line2, "BPM: %.1f", currentBpm);
   sprintf(line3, "AVG: %d", averageBpm);
 
-  if (isnan(objectTemp)) {
-    strcpy(line4, "Temp: --.-- C");
+  if (tempValid) {
+    sprintf(line4, "Temp: %.2fC", calibratedObjectTemp);
   } else {
-    char tempText[10];
-    dtostrf(objectTemp, 4, 2, tempText);
-    sprintf(line4, "Temp:%s C", tempText);
+    strcpy(line4, "Temp: INVALID");
+  }
+
+  if (tempStable) {
+    strcpy(line5, "Stable: YES");
+  } else {
+    strcpy(line5, "Stable: NO");
   }
 
   oled.clearBuffer();
-  oled.setFont(u8g2_font_6x10_tr);
+  oled.setFont(u8g2_font_5x7_tr);
 
-  oled.drawStr(0, 12, "Nano Sensor System");
-  oled.drawStr(0, 28, line1);
-  oled.drawStr(0, 42, bpmText);
-  oled.drawStr(0, 54, line3);
-  oled.drawStr(0, 64, line4);
+  oled.drawStr(0, 10, "Wearable Sensor Test");
+  oled.drawStr(0, 22, line1);
+  oled.drawStr(0, 34, line2);
+  oled.drawStr(0, 46, line3);
+  oled.drawStr(0, 56, line4);
+  oled.drawStr(0, 64, line5);
 
   oled.sendBuffer();
 }
 
 void printDebug() {
-  Serial.print("Finger: ");
+  Serial.print("Finger=");
   Serial.print(fingerDetected ? "YES" : "NO");
-  Serial.print(" | BPM: ");
+
+  Serial.print(" | BPM=");
   Serial.print(currentBpm, 1);
-  Serial.print(" | AVG: ");
+
+  Serial.print(" | AVG_BPM=");
   Serial.print(averageBpm);
-  Serial.print(" | Ta: ");
-  Serial.print(ambientTemp, 2);
-  Serial.print(" | To: ");
-  Serial.println(objectTemp, 2);
+
+  Serial.print(" | BPM_VALID=");
+  Serial.print(bpmValid ? "YES" : "NO");
+
+  Serial.print(" | RAW_AMBIENT=");
+  Serial.print(rawAmbientTemp, 2);
+
+  Serial.print(" | RAW_OBJECT=");
+  Serial.print(rawObjectTemp, 2);
+
+  Serial.print(" | CAL_AMBIENT=");
+  Serial.print(calibratedAmbientTemp, 2);
+
+  Serial.print(" | CAL_OBJECT=");
+  Serial.print(calibratedObjectTemp, 2);
+
+  Serial.print(" | TEMP_VALID=");
+  Serial.print(tempValid ? "YES" : "NO");
+
+  Serial.print(" | TEMP_STABLE=");
+  Serial.print(tempStable ? "YES" : "NO");
+
+  if (tempSampleCount > 0) {
+    Serial.print(" | TEMP_MIN=");
+    Serial.print(tempMin, 2);
+
+    Serial.print(" | TEMP_MAX=");
+    Serial.print(tempMax, 2);
+
+    Serial.print(" | TEMP_RANGE=");
+    Serial.print(tempMax - tempMin, 2);
+
+    Serial.print(" | TEMP_AVG=");
+    Serial.print(getAverageTemperature(), 2);
+  }
+
+  Serial.println();
 }
 
-// =========================
-// Setup
-// =========================
+void showStartupMessage(const char* msg1, const char* msg2) {
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_5x7_tr);
+  oled.drawStr(0, 20, msg1);
+  oled.drawStr(0, 34, msg2);
+  oled.sendBuffer();
+}
+
+// =====================================================
+// SETUP
+// =====================================================
 void setup() {
   Serial.begin(115200);
 
@@ -176,29 +300,22 @@ void setup() {
   Wire.setClock(100000);
 
   oled.begin();
-  oled.clearBuffer();
-  oled.setFont(u8g2_font_6x10_tr);
-  oled.drawStr(0, 20, "Starting...");
-  oled.sendBuffer();
+  showStartupMessage("Starting system...", "Please wait");
 
   if (!tempSensor.begin()) {
-    oled.clearBuffer();
-    oled.drawStr(0, 20, "MLX90614 failed");
-    oled.sendBuffer();
+    showStartupMessage("MLX90614 failed", "Check wiring");
     while (1);
   }
 
   if (!pulseSensor.begin(Wire, I2C_SPEED_STANDARD)) {
-    oled.clearBuffer();
-    oled.drawStr(0, 20, "MAX30102 failed");
-    oled.sendBuffer();
+    showStartupMessage("MAX30102 failed", "Check wiring");
     while (1);
   }
 
   pulseSensor.setup(
     20,     // LED brightness
     4,      // sample average
-    2,      // LED mode
+    2,      // LED mode (Red + IR)
     100,    // sample rate
     411,    // pulse width
     16384   // ADC range
@@ -208,30 +325,37 @@ void setup() {
   pulseSensor.setPulseAmplitudeIR(0x10);
 
   resetHeartData();
+  resetTempStats();
 
-  oled.clearBuffer();
-  oled.drawStr(0, 20, "System Ready");
-  oled.sendBuffer();
-  delay(800);
+  showStartupMessage("System Ready", "Testing sensors");
+  delay(1000);
 }
 
-// =========================
-// Loop
-// =========================
+// =====================================================
+// LOOP
+// =====================================================
 void loop() {
-  readHeart();
-
   unsigned long now = millis();
 
-  if (now - previousTempRead >= TEMP_READ_INTERVAL) {
-    previousTempRead = now;
+  // continuous heart-rate reading
+  readHeartRate();
+
+  // temperature read interval
+  if (now - lastTempReadTime >= TEMP_INTERVAL_MS) {
+    lastTempReadTime = now;
     readTemperature();
-    printDebug();
   }
 
-  if (now - previousDisplayRefresh >= DISPLAY_INTERVAL) {
-    previousDisplayRefresh = now;
-    drawScreen();
+  // OLED update interval
+  if (now - lastDisplayTime >= DISPLAY_INTERVAL_MS) {
+    lastDisplayTime = now;
+    drawDisplay();
+  }
+
+  // Serial proof output interval
+  if (now - lastDebugTime >= DEBUG_INTERVAL_MS) {
+    lastDebugTime = now;
+    printDebug();
   }
 
   delay(5);
