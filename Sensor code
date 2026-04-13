@@ -1,0 +1,238 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <Adafruit_MLX90614.h>
+#include <U8g2lib.h>
+
+// =========================
+// Devices
+// =========================
+MAX30105 pulseSensor;
+Adafruit_MLX90614 tempSensor = Adafruit_MLX90614();
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
+
+// =========================
+// Heart rate variables
+// =========================
+const byte BPM_SLOTS = 8;
+int bpmBuffer[BPM_SLOTS];
+byte bpmPointer = 0;
+byte bpmStored = 0;
+
+float currentBpm = 0.0;
+int averageBpm = 0;
+unsigned long previousBeatTime = 0;
+bool fingerDetected = false;
+
+// =========================
+// Temperature variables
+// =========================
+float ambientTemp = NAN;
+float objectTemp = NAN;
+
+// =========================
+// Timing
+// =========================
+unsigned long previousTempRead = 0;
+unsigned long previousDisplayRefresh = 0;
+const unsigned long TEMP_READ_INTERVAL = 500;
+const unsigned long DISPLAY_INTERVAL = 200;
+
+// =========================
+// Settings
+// =========================
+const long IR_FINGER_THRESHOLD = 8000;
+
+// =========================
+// Helpers
+// =========================
+void resetHeartData() {
+  currentBpm = 0;
+  averageBpm = 0;
+  previousBeatTime = 0;
+  bpmPointer = 0;
+  bpmStored = 0;
+
+  for (byte i = 0; i < BPM_SLOTS; i++) {
+    bpmBuffer[i] = 0;
+  }
+}
+
+void pushBpm(int value) {
+  bpmBuffer[bpmPointer] = value;
+  bpmPointer = (bpmPointer + 1) % BPM_SLOTS;
+
+  if (bpmStored < BPM_SLOTS) {
+    bpmStored++;
+  }
+
+  int sum = 0;
+  for (byte i = 0; i < bpmStored; i++) {
+    sum += bpmBuffer[i];
+  }
+
+  if (bpmStored > 0) {
+    averageBpm = sum / bpmStored;
+  }
+}
+
+void readHeart() {
+  long irValue = pulseSensor.getIR();
+  fingerDetected = (irValue > IR_FINGER_THRESHOLD);
+
+  if (!fingerDetected) {
+    resetHeartData();
+    return;
+  }
+
+  if (checkForBeat(irValue)) {
+    unsigned long now = millis();
+
+    if (previousBeatTime != 0) {
+      float secondsBetween = (now - previousBeatTime) / 1000.0;
+      float bpm = 60.0 / secondsBetween;
+
+      if (bpm >= 35 && bpm <= 200) {
+        currentBpm = bpm;
+        pushBpm((int)(bpm + 0.5));
+      }
+    }
+
+    previousBeatTime = now;
+  }
+}
+
+void readTemperature() {
+  float roomTemp = tempSensor.readAmbientTempC();
+  float targetTemp = tempSensor.readObjectTempC();
+
+  if (!isnan(roomTemp)) {
+    ambientTemp = roomTemp;
+  }
+
+  if (!isnan(targetTemp)) {
+    objectTemp = targetTemp;
+  }
+}
+
+void drawScreen() {
+  char line1[24];
+  char line2[24];
+  char line3[24];
+  char line4[24];
+
+  if (fingerDetected) {
+    strcpy(line1, "Finger: YES");
+  } else {
+    strcpy(line1, "Finger: NO");
+  }
+
+  dtostrf(currentBpm, 4, 1, line2);
+  char bpmText[24];
+  sprintf(bpmText, "BPM: %s", line2);
+
+  sprintf(line3, "AVG: %d", averageBpm);
+
+  if (isnan(objectTemp)) {
+    strcpy(line4, "Temp: --.-- C");
+  } else {
+    char tempText[10];
+    dtostrf(objectTemp, 4, 2, tempText);
+    sprintf(line4, "Temp:%s C", tempText);
+  }
+
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_6x10_tr);
+
+  oled.drawStr(0, 12, "Nano Sensor System");
+  oled.drawStr(0, 28, line1);
+  oled.drawStr(0, 42, bpmText);
+  oled.drawStr(0, 54, line3);
+  oled.drawStr(0, 64, line4);
+
+  oled.sendBuffer();
+}
+
+void printDebug() {
+  Serial.print("Finger: ");
+  Serial.print(fingerDetected ? "YES" : "NO");
+  Serial.print(" | BPM: ");
+  Serial.print(currentBpm, 1);
+  Serial.print(" | AVG: ");
+  Serial.print(averageBpm);
+  Serial.print(" | Ta: ");
+  Serial.print(ambientTemp, 2);
+  Serial.print(" | To: ");
+  Serial.println(objectTemp, 2);
+}
+
+// =========================
+// Setup
+// =========================
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin();
+  Wire.setClock(100000);
+
+  oled.begin();
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_6x10_tr);
+  oled.drawStr(0, 20, "Starting...");
+  oled.sendBuffer();
+
+  if (!tempSensor.begin()) {
+    oled.clearBuffer();
+    oled.drawStr(0, 20, "MLX90614 failed");
+    oled.sendBuffer();
+    while (1);
+  }
+
+  if (!pulseSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    oled.clearBuffer();
+    oled.drawStr(0, 20, "MAX30102 failed");
+    oled.sendBuffer();
+    while (1);
+  }
+
+  pulseSensor.setup(
+    20,     // LED brightness
+    4,      // sample average
+    2,      // LED mode
+    100,    // sample rate
+    411,    // pulse width
+    16384   // ADC range
+  );
+
+  pulseSensor.setPulseAmplitudeRed(0x10);
+  pulseSensor.setPulseAmplitudeIR(0x10);
+
+  resetHeartData();
+
+  oled.clearBuffer();
+  oled.drawStr(0, 20, "System Ready");
+  oled.sendBuffer();
+  delay(800);
+}
+
+// =========================
+// Loop
+// =========================
+void loop() {
+  readHeart();
+
+  unsigned long now = millis();
+
+  if (now - previousTempRead >= TEMP_READ_INTERVAL) {
+    previousTempRead = now;
+    readTemperature();
+    printDebug();
+  }
+
+  if (now - previousDisplayRefresh >= DISPLAY_INTERVAL) {
+    previousDisplayRefresh = now;
+    drawScreen();
+  }
+
+  delay(5);
+}
